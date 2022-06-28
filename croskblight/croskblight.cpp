@@ -1,13 +1,10 @@
 #define DESCRIPTOR_DEF
 #include "croskblight.h"
-#include "KeyboardBacklight.h"
+#include <acpiioct.h>
+#include <ntstrsafe.h>
 
 static ULONG CrosKBLightDebugLevel = 100;
 static ULONG CrosKBLightDebugCatagories = DBG_INIT || DBG_PNP || DBG_IOCTL;
-
-extern "C" {
-	int comm_init_lpc(void);
-}
 
 NTSTATUS
 DriverEntry(
@@ -46,6 +43,190 @@ DriverEntry(
 	return status;
 }
 
+NTSTATUS ConnectToEc(
+	_In_ WDFDEVICE FxDevice
+) {
+	PCROSKBLIGHT_CONTEXT pDevice = GetDeviceContext(FxDevice);
+	WDF_OBJECT_ATTRIBUTES objectAttributes;
+
+	WDF_OBJECT_ATTRIBUTES_INIT(&objectAttributes);
+	objectAttributes.ParentObject = FxDevice;
+
+	NTSTATUS status = WdfIoTargetCreate(FxDevice,
+		&objectAttributes,
+		&pDevice->busIoTarget
+	);
+	if (!NT_SUCCESS(status))
+	{
+		CrosKBLightPrint(
+			DEBUG_LEVEL_ERROR,
+			DBG_IOCTL,
+			"Error creating IoTarget object - 0x%x\n",
+			status);
+		if (pDevice->busIoTarget)
+			WdfObjectDelete(pDevice->busIoTarget);
+		return status;
+	}
+
+	DECLARE_CONST_UNICODE_STRING(busDosDeviceName, L"\\DosDevices\\GOOG0004");
+
+	WDF_IO_TARGET_OPEN_PARAMS openParams;
+	WDF_IO_TARGET_OPEN_PARAMS_INIT_OPEN_BY_NAME(
+		&openParams,
+		&busDosDeviceName,
+		(GENERIC_READ | GENERIC_WRITE));
+
+	openParams.ShareAccess = FILE_SHARE_READ | FILE_SHARE_WRITE;
+	openParams.CreateDisposition = FILE_OPEN;
+	openParams.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+
+	CROSEC_INTERFACE_STANDARD CrosEcInterface;
+	RtlZeroMemory(&CrosEcInterface, sizeof(CrosEcInterface));
+
+	status = WdfIoTargetOpen(pDevice->busIoTarget, &openParams);
+	if (!NT_SUCCESS(status))
+	{
+		CrosKBLightPrint(
+			DEBUG_LEVEL_ERROR,
+			DBG_IOCTL,
+			"Error opening IoTarget object - 0x%x\n",
+			status);
+		WdfObjectDelete(pDevice->busIoTarget);
+		return status;
+	}
+
+	status = WdfIoTargetQueryForInterface(pDevice->busIoTarget,
+		&GUID_CROSEC_INTERFACE_STANDARD,
+		(PINTERFACE)&CrosEcInterface,
+		sizeof(CrosEcInterface),
+		1,
+		NULL);
+	WdfIoTargetClose(pDevice->busIoTarget);
+	pDevice->busIoTarget = NULL;
+	if (!NT_SUCCESS(status)) {
+		CrosKBLightPrint(DEBUG_LEVEL_ERROR, DBG_PNP,
+			"WdfFdoQueryForInterface failed 0x%x\n", status);
+		return status;
+	}
+
+	pDevice->CrosEcBusContext = CrosEcInterface.InterfaceHeader.Context;
+	pDevice->CrosEcCmdXferStatus = CrosEcInterface.CmdXferStatus;
+	return status;
+}
+
+static NTSTATUS send_ec_command(
+	_In_ PCROSKBLIGHT_CONTEXT pDevice,
+	UINT32 cmd,
+	UINT32 version,
+	UINT8* out,
+	size_t outSize,
+	UINT8* in,
+	size_t inSize)
+{
+	PCROSEC_COMMAND msg = (PCROSEC_COMMAND)ExAllocatePoolWithTag(NonPagedPool, sizeof(CROSEC_COMMAND) + max(outSize, inSize), CROSKBLIGHT_POOL_TAG);
+	if (!msg) {
+		return STATUS_NO_MEMORY;
+	}
+	msg->Version = version;
+	msg->Command = cmd;
+	msg->OutSize = outSize;
+	msg->InSize = inSize;
+
+	if (outSize)
+		memcpy(msg->Data, out, outSize);
+
+	NTSTATUS status = (*pDevice->CrosEcCmdXferStatus)(pDevice->CrosEcBusContext, msg);
+	if (!NT_SUCCESS(status)) {
+		goto exit;
+	}
+
+	if (in && inSize) {
+		memcpy(in, msg->Data, inSize);
+	}
+
+exit:
+	ExFreePoolWithTag(msg, CROSKBLIGHT_POOL_TAG);
+	return status;
+}
+
+/**
+ * Get the versions of the command supported by the EC.
+ *
+ * @param cmd		Command
+ * @param pmask		Destination for version mask; will be set to 0 on
+ *			error.
+ */
+static NTSTATUS cros_ec_get_cmd_versions(PCROSKBLIGHT_CONTEXT pDevice, int cmd, UINT32* pmask) {
+	struct ec_params_get_cmd_versions_v1 pver_v1;
+	struct ec_params_get_cmd_versions pver;
+	struct ec_response_get_cmd_versions rver;
+	NTSTATUS status;
+
+	*pmask = 0;
+
+	pver_v1.cmd = cmd;
+	status = send_ec_command(pDevice, EC_CMD_GET_CMD_VERSIONS, 1, (UINT8*)&pver_v1, sizeof(pver_v1),
+		(UINT8*)&rver, sizeof(rver));
+
+	if (!NT_SUCCESS(status)) {
+		pver.cmd = cmd;
+		status = send_ec_command(pDevice, EC_CMD_GET_CMD_VERSIONS, 0, (UINT8*)&pver, sizeof(pver),
+			(UINT8*)&rver, sizeof(rver));
+	}
+
+	*pmask = rver.version_mask;
+	return status;
+}
+
+/**
+ * Return non-zero if the EC supports the command and version
+ *
+ * @param cmd		Command to check
+ * @param ver		Version to check
+ * @return non-zero if command version supported; 0 if not.
+ */
+BOOLEAN cros_ec_cmd_version_supported(PCROSKBLIGHT_CONTEXT pDevice, int cmd, int ver)
+{
+	UINT32 mask = 0;
+
+	if (NT_SUCCESS(cros_ec_get_cmd_versions(pDevice, cmd, &mask)))
+		return false;
+
+	return (mask & EC_VER_MASK(ver)) ? true : false;
+}
+
+NTSTATUS
+CrosKBLightGetBacklight(
+	_In_ PCROSKBLIGHT_CONTEXT pDevice,
+	UINT8* PBacklight
+)
+{
+	struct ec_response_pwm_get_keyboard_backlight backlightParams;
+	NTSTATUS status = send_ec_command(pDevice, EC_CMD_PWM_GET_KEYBOARD_BACKLIGHT, 0, NULL, 0, (UINT8*)&backlightParams, sizeof(struct ec_response_pwm_get_keyboard_backlight));
+	if (!NT_SUCCESS(status))
+		return status;
+	if (PBacklight) {
+		if (backlightParams.enabled) {
+			*PBacklight = backlightParams.percent;
+		}
+		else {
+			*PBacklight = 0;
+		}
+	}
+	return status;
+}
+
+NTSTATUS
+CrosKBLightSetBacklight(
+	_In_ PCROSKBLIGHT_CONTEXT pDevice,
+	UINT8 Backlight
+)
+{
+	struct ec_params_pwm_set_keyboard_backlight backlightParams;
+	backlightParams.percent = Backlight;
+	return send_ec_command(pDevice, EC_CMD_PWM_SET_KEYBOARD_BACKLIGHT, 0, (UINT8*)&backlightParams, sizeof(struct ec_params_pwm_set_keyboard_backlight), NULL, 0);
+}
+
 NTSTATUS
 OnPrepareHardware(
 	_In_  WDFDEVICE     FxDevice,
@@ -73,10 +254,19 @@ OnPrepareHardware(
 	--*/
 {
 	PCROSKBLIGHT_CONTEXT pDevice = GetDeviceContext(FxDevice);
-	BOOLEAN fSpbResourceFound = FALSE;
 	NTSTATUS status = STATUS_SUCCESS;
 
 	UNREFERENCED_PARAMETER(FxResourcesRaw);
+	UNREFERENCED_PARAMETER(FxResourcesTranslated);
+
+	status = ConnectToEc(FxDevice);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+
+	(*pDevice->CrosEcCmdXferStatus)(pDevice->CrosEcBusContext, NULL);
+
+	CrosKBLightGetBacklight(pDevice, &pDevice->currentBrightness);
 
 	return status;
 }
@@ -137,7 +327,7 @@ OnD0Entry(
 	PCROSKBLIGHT_CONTEXT pDevice = GetDeviceContext(FxDevice);
 	NTSTATUS status = STATUS_SUCCESS;
 
-	WdfTimerStart(pDevice->Timer, WDF_REL_TIMEOUT_IN_MS(10));
+	CrosKBLightSetBacklight(pDevice, pDevice->currentBrightness);
 
 	return status;
 }
@@ -168,8 +358,6 @@ OnD0Exit(
 
 	PCROSKBLIGHT_CONTEXT pDevice = GetDeviceContext(FxDevice);
 
-	WdfTimerStop(pDevice->Timer, TRUE);
-
 	return STATUS_SUCCESS;
 }
 
@@ -180,47 +368,6 @@ static void update_brightness(PCROSKBLIGHT_CONTEXT pDevice, BYTE brightness) {
 
 	size_t bytesWritten;
 	CrosKBLightProcessVendorReport(pDevice, &report, sizeof(report), &bytesWritten);
-}
-
-VOID
-CrosKBLightWorkItem(
-	IN WDFWORKITEM  WorkItem
-)
-{
-	WDFDEVICE Device = (WDFDEVICE)WdfWorkItemGetParentObject(WorkItem);
-	PCROSKBLIGHT_CONTEXT pDevice = GetDeviceContext(Device);
-
-	WdfObjectDelete(WorkItem);
-
-	int brightness = CROSKBLIGHTGetBacklight();
-	if (brightness < 0)
-		return;
-
-	if (pDevice->currentBrightness != brightness) {
-		CROSKBLIGHTSetBacklight(pDevice->currentBrightness);
-	}
-}
-
-void CrosKBLightTimerFunc(_In_ WDFTIMER hTimer) {
-	WDFDEVICE Device = (WDFDEVICE)WdfTimerGetParentObject(hTimer);
-	PCROSKBLIGHT_CONTEXT pDevice = GetDeviceContext(Device);
-
-	WDF_OBJECT_ATTRIBUTES attributes;
-	WDF_WORKITEM_CONFIG workitemConfig;
-	WDFWORKITEM hWorkItem;
-
-	WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
-	WDF_OBJECT_ATTRIBUTES_SET_CONTEXT_TYPE(&attributes, CROSKBLIGHT_CONTEXT);
-	attributes.ParentObject = Device;
-	WDF_WORKITEM_CONFIG_INIT(&workitemConfig, CrosKBLightWorkItem);
-
-	WdfWorkItemCreate(&workitemConfig,
-		&attributes,
-		&hWorkItem);
-
-	WdfWorkItemEnqueue(hWorkItem);
-
-	return;
 }
 
 NTSTATUS
@@ -332,6 +479,7 @@ CrosKBLightEvtDeviceAdd(
 	//
 
 	devContext = GetDeviceContext(device);
+	devContext->FxDevice = device;
 
 	WDF_IO_QUEUE_CONFIG_INIT(&queueConfig, WdfIoQueueDispatchManual);
 
@@ -351,31 +499,11 @@ CrosKBLightEvtDeviceAdd(
 		return status;
 	}
 
-	WDF_TIMER_CONFIG              timerConfig;
-	WDFTIMER                      hTimer;
-
-	WDF_TIMER_CONFIG_INIT_PERIODIC(&timerConfig, CrosKBLightTimerFunc, 10);
-
-	WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
-	attributes.ParentObject = device;
-	status = WdfTimerCreate(&timerConfig, &attributes, &hTimer);
-	devContext->Timer = hTimer;
-	if (!NT_SUCCESS(status))
-	{
-		CrosKBLightPrint(DEBUG_LEVEL_ERROR, DBG_PNP, "(%!FUNC!) WdfTimerCreate failed status:%!STATUS!\n", status);
-		return status;
-	}
-
 	//
 	// Initialize DeviceMode
 	//
 
 	devContext->DeviceMode = DEVICE_MODE_MOUSE;
-	
-	comm_init_lpc();
-
-	CROSKBLIGHTSetBacklight(100);
-	devContext->currentBrightness = 100;
 
 	return status;
 }
@@ -436,8 +564,8 @@ CrosKBLightEvtWdmPreprocessMnQueryId(
 			//
 			buffer = (PWCHAR)ExAllocatePoolWithTag(
 				NonPagedPool,
-				CROSKEYBOARD_HARDWARE_IDS_LENGTH,
-				CROSKEYBOARD_POOL_TAG
+				CROSKBLIGHT_HARDWARE_IDS_LENGTH,
+				CROSKBLIGHT_POOL_TAG
 				);
 
 			if (buffer)
@@ -446,8 +574,8 @@ CrosKBLightEvtWdmPreprocessMnQueryId(
 				// Do the copy, store the buffer in the Irp
 				//
 				RtlCopyMemory(buffer,
-					CROSKEYBOARD_HARDWARE_IDS,
-					CROSKEYBOARD_HARDWARE_IDS_LENGTH
+					CROSKBLIGHT_HARDWARE_IDS,
+					CROSKBLIGHT_HARDWARE_IDS_LENGTH
 					);
 
 				Irp->IoStatus.Information = (ULONG_PTR)buffer;
@@ -957,7 +1085,7 @@ CrosKBLightWriteReport(
 				}
 				else if (reg == 1) {
 					DevContext->currentBrightness = val;
-					CROSKBLIGHTSetBacklight(val);
+					CrosKBLightSetBacklight(DevContext, DevContext->currentBrightness);
 				}
 				break;
 			}

@@ -17,7 +17,7 @@
 #include <hidport.h>
 
 #include "hidcommon.h"
-#include "spb.h"
+#include "eccmds.h"
 
 extern "C"
 
@@ -34,11 +34,11 @@ EVT_WDF_OBJECT_CONTEXT_CLEANUP  OnDriverCleanup;
 // String definitions
 //
 
-#define DRIVERNAME                 "croskeyboard3.sys: "
+#define DRIVERNAME                 "croskblight.sys: "
 
-#define CROSKEYBOARD_POOL_TAG            (ULONG) 'lmtA'
-#define CROSKEYBOARD_HARDWARE_IDS        L"CoolStar\\CrosKBLight\0\0"
-#define CROSKEYBOARD_HARDWARE_IDS_LENGTH sizeof(CROSKEYBOARD_HARDWARE_IDS)
+#define CROSKBLIGHT_POOL_TAG            (ULONG) 'lbkC'
+#define CROSKBLIGHT_HARDWARE_IDS        L"CoolStar\\CrosKBLight\0\0"
+#define CROSKBLIGHT_HARDWARE_IDS_LENGTH sizeof(CROSKBLIGHT_HARDWARE_IDS)
 
 #define NTDEVICE_NAME_STRING       L"\\Device\\CrosKBLight"
 #define SYMBOLIC_NAME_STRING       L"\\DosDevices\\CrosKBLight"
@@ -89,16 +89,59 @@ CONST HID_DESCRIPTOR DefaultHidDescriptor = {
 #define true 1
 #define false 0
 
+typedef struct _CROSEC_COMMAND {
+	UINT32 Version;
+	UINT32 Command;
+	UINT32 OutSize;
+	UINT32 InSize;
+	UINT32 Result;
+	UINT8 Data[];
+} CROSEC_COMMAND, * PCROSEC_COMMAND;
+
+typedef
+NTSTATUS
+(*PCROSEC_CMD_XFER_STATUS)(
+	IN      PVOID Context,
+	OUT     PCROSEC_COMMAND Msg
+	);
+
+typedef
+BOOLEAN
+(*PCROSEC_CHECK_FEATURES)(
+	IN PVOID Context,
+	IN INT Feature
+	);
+
+DEFINE_GUID(GUID_CROSEC_INTERFACE_STANDARD,
+	0xd7062676, 0xe3a4, 0x11ec, 0xa6, 0xc4, 0x24, 0x4b, 0xfe, 0x99, 0x46, 0xd0);
+
+/*DEFINE_GUID(GUID_DEVICE_PROPERTIES,
+	0xdaffd814, 0x6eba, 0x4d8c, 0x8a, 0x91, 0xbc, 0x9b, 0xbf, 0x4a, 0xa3, 0x01);*/ //Windows defender false positive
+
+	//
+	// Interface for getting and setting power level etc.,
+	//
+typedef struct _CROSEC_INTERFACE_STANDARD {
+	INTERFACE                        InterfaceHeader;
+	PCROSEC_CMD_XFER_STATUS          CmdXferStatus;
+	PCROSEC_CHECK_FEATURES           CheckFeatures;
+} CROSEC_INTERFACE_STANDARD, * PCROSEC_INTERFACE_STANDARD;
+
 typedef struct _CROSKBLIGHT_CONTEXT
 {
+	WDFDEVICE FxDevice;
 
 	WDFQUEUE ReportQueue;
 
 	BYTE DeviceMode;
 
-	WDFTIMER Timer;
+	UINT8 currentBrightness;
 
-	int currentBrightness;
+	PVOID CrosEcBusContext;
+
+	PCROSEC_CMD_XFER_STATUS CrosEcCmdXferStatus;
+
+	WDFIOTARGET busIoTarget;
 
 } CROSKBLIGHT_CONTEXT, *PCROSKBLIGHT_CONTEXT;
 
