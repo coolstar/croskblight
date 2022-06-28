@@ -47,8 +47,6 @@ int main(int argc, char** argv)
         return -1;
     }
 
-    printf("Current Brightness: %d, New Brightness: %d\n", readReport.Brightness, brightness);
-
     if (brightness < 0) {
         brightness = 0;
     }
@@ -64,4 +62,9 @@ int main(int argc, char** argv)
         return -1;
     }
     return 0;
+}
+
+int __stdcall WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, char* lpCmdLine, int nShowCmd)
+{
+    return main(__argc, __argv);
 }
