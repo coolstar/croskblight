@@ -6,8 +6,8 @@
 
 int main(int argc, char** argv)
 {
-    if (argc < 3) {
-        return 0;
+    if (argc < 2) {
+        return -1;
     }
 
     pcroskblight_client client = croskblight_alloc();
@@ -31,9 +31,12 @@ int main(int argc, char** argv)
         return -1;
     }
 
-    long argInt = strtol(argv[2], NULL, 10);
-
     int brightness = readReport.Brightness;
+    if (strcmp(argv[1], "r") == 0) {
+        return brightness;
+    }
+
+    long argInt = strtol(argv[2], NULL, 10);
 
     if (strcmp(argv[1], "=") == 0) {
         brightness = argInt;
@@ -41,9 +44,12 @@ int main(int argc, char** argv)
         brightness += argInt;
     } else if (strcmp(argv[1], "-") == 0) {
         brightness -= argInt;
+    } else {
+        printf("Arg2 must be =, +, -, or r\n");
+        return -1;
     }
-    else {
-        printf("Arg2 must be =, + or -\n");
+
+    if (argc < 3) {
         return -1;
     }
 
