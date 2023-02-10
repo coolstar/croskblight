@@ -130,7 +130,7 @@
       <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>
     </DriverSign>
     <Inf>
-      <TimeStamp>2.0</TimeStamp>
+      <TimeStamp>2.0.1</TimeStamp>
     </Inf>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -158,7 +158,7 @@
       <WarningLevel>Level4</WarningLevel>
     </ClCompile>
     <Inf>
-      <TimeStamp>2.0</TimeStamp>
+      <TimeStamp>2.0.1</TimeStamp>
     </Inf>
     <DriverSign>
       <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>

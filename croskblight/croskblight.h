@@ -12,6 +12,8 @@
 #pragma warning(default:4214)
 #include <wdf.h>
 
+#include <wdmguid.h>
+
 #pragma warning(disable:4201)  // suppress nameless struct/union warning
 #pragma warning(disable:4214)  // suppress bit field types other than int warning
 #include <hidport.h>
@@ -138,6 +140,9 @@ typedef struct _CROSKBLIGHT_CONTEXT
 	UINT8 currentBrightness;
 
 	PVOID CrosEcBusContext;
+
+	//S0IX Notify
+	ACPI_INTERFACE_STANDARD2 S0ixNotifyAcpiInterface;
 
 	PCROSEC_CMD_XFER_STATUS CrosEcCmdXferStatus;
 

@@ -3,6 +3,11 @@
 #include <acpiioct.h>
 #include <ntstrsafe.h>
 
+VOID
+CrosKBLightS0ixNotifyCallback(
+	PCROSKBLIGHT_CONTEXT pDevice,
+	ULONG NotifyCode);
+
 static ULONG CrosKBLightDebugLevel = 100;
 static ULONG CrosKBLightDebugCatagories = DBG_INIT || DBG_PNP || DBG_IOCTL;
 
@@ -268,6 +273,25 @@ OnPrepareHardware(
 
 	CrosKBLightGetBacklight(pDevice, &pDevice->currentBrightness);
 
+	status = WdfFdoQueryForInterface(FxDevice,
+		&GUID_ACPI_INTERFACE_STANDARD2,
+		(PINTERFACE)&pDevice->S0ixNotifyAcpiInterface,
+		sizeof(ACPI_INTERFACE_STANDARD2),
+		1,
+		NULL);
+
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+
+	status = pDevice->S0ixNotifyAcpiInterface.RegisterForDeviceNotifications(
+		pDevice->S0ixNotifyAcpiInterface.Context,
+		(PDEVICE_NOTIFY_CALLBACK2)CrosKBLightS0ixNotifyCallback,
+		pDevice);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+
 	return status;
 }
 
@@ -296,6 +320,10 @@ OnReleaseHardware(
 	NTSTATUS status = STATUS_SUCCESS;
 
 	UNREFERENCED_PARAMETER(FxResourcesTranslated);
+
+	if (pDevice->S0ixNotifyAcpiInterface.Context) { //Used for S0ix notifications
+		pDevice->S0ixNotifyAcpiInterface.UnregisterForDeviceNotifications(pDevice->S0ixNotifyAcpiInterface.Context);
+	}
 
 	return status;
 }
@@ -335,7 +363,7 @@ OnD0Entry(
 NTSTATUS
 OnD0Exit(
 	_In_  WDFDEVICE               FxDevice,
-	_In_  WDF_POWER_DEVICE_STATE  FxPreviousState
+	_In_  WDF_POWER_DEVICE_STATE  FxTargetState
 	)
 	/*++
 
@@ -346,7 +374,7 @@ OnD0Exit(
 	Arguments:
 
 	FxDevice - a handle to the framework device object
-	FxPreviousState - previous power state
+	FxTargetState - target power state
 
 	Return Value:
 
@@ -354,11 +382,26 @@ OnD0Exit(
 
 	--*/
 {
-	UNREFERENCED_PARAMETER(FxPreviousState);
-
 	PCROSKBLIGHT_CONTEXT pDevice = GetDeviceContext(FxDevice);
 
+	if (FxTargetState != WdfPowerDeviceD3Final &&
+		FxTargetState != WdfPowerDevicePrepareForHibernation) {
+		CrosKBLightSetBacklight(pDevice, 0);
+	}
+
 	return STATUS_SUCCESS;
+}
+
+VOID
+CrosKBLightS0ixNotifyCallback(
+	PCROSKBLIGHT_CONTEXT pDevice,
+	ULONG NotifyCode) {
+	if (NotifyCode) {
+		OnD0Exit(pDevice->FxDevice, WdfPowerDeviceD3);
+	}
+	else {
+		OnD0Entry(pDevice->FxDevice, WdfPowerDeviceD3);
+	}
 }
 
 static void update_brightness(PCROSKBLIGHT_CONTEXT pDevice, BYTE brightness) {
@@ -413,28 +456,6 @@ CrosKBLightEvtDeviceAdd(
 	}
 
 	//
-	// Because we are a virtual device the root enumerator would just put null values 
-	// in response to IRP_MN_QUERY_ID. Lets override that.
-	//
-
-	minorFunction = IRP_MN_QUERY_ID;
-
-	status = WdfDeviceInitAssignWdmIrpPreprocessCallback(
-		DeviceInit,
-		CrosKBLightEvtWdmPreprocessMnQueryId,
-		IRP_MJ_PNP,
-		&minorFunction,
-		1
-		);
-	if (!NT_SUCCESS(status))
-	{
-		CrosKBLightPrint(DEBUG_LEVEL_ERROR, DBG_PNP,
-			"WdfDeviceInitAssignWdmIrpPreprocessCallback failed Status 0x%x\n", status);
-
-		return status;
-	}
-
-	//
 	// Setup the device context
 	//
 
@@ -454,6 +475,14 @@ CrosKBLightEvtDeviceAdd(
 			"WdfDeviceCreate failed with status code 0x%x\n", status);
 
 		return status;
+	}
+
+	{
+		WDF_DEVICE_STATE deviceState;
+		WDF_DEVICE_STATE_INIT(&deviceState);
+
+		deviceState.NotDisableable = WdfFalse;
+		WdfDeviceSetDeviceState(device, &deviceState);
 	}
 
 	WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchParallel);
@@ -504,110 +533,6 @@ CrosKBLightEvtDeviceAdd(
 	//
 
 	devContext->DeviceMode = DEVICE_MODE_MOUSE;
-
-	return status;
-}
-
-NTSTATUS
-CrosKBLightEvtWdmPreprocessMnQueryId(
-	WDFDEVICE Device,
-	PIRP Irp
-	)
-{
-	NTSTATUS            status;
-	PIO_STACK_LOCATION  IrpStack, previousSp;
-	PDEVICE_OBJECT      DeviceObject;
-	PWCHAR              buffer;
-
-	PAGED_CODE();
-
-	//
-	// Get a pointer to the current location in the Irp
-	//
-
-	IrpStack = IoGetCurrentIrpStackLocation(Irp);
-
-	//
-	// Get the device object
-	//
-	DeviceObject = WdfDeviceWdmGetDeviceObject(Device);
-
-
-	CrosKBLightPrint(DEBUG_LEVEL_VERBOSE, DBG_PNP,
-		"CrosKBLightEvtWdmPreprocessMnQueryId Entry\n");
-
-	//
-	// This check is required to filter out QUERY_IDs forwarded
-	// by the HIDCLASS for the parent FDO. These IDs are sent
-	// by PNP manager for the parent FDO if you root-enumerate this driver.
-	//
-	previousSp = ((PIO_STACK_LOCATION)((UCHAR *)(IrpStack)+
-		sizeof(IO_STACK_LOCATION)));
-
-	if (previousSp->DeviceObject == DeviceObject)
-	{
-		//
-		// Filtering out this basically prevents the Found New Hardware
-		// popup for the root-enumerated CrosKBLight on reboot.
-		//
-		status = Irp->IoStatus.Status;
-	}
-	else
-	{
-		switch (IrpStack->Parameters.QueryId.IdType)
-		{
-		case BusQueryDeviceID:
-		case BusQueryHardwareIDs:
-			//
-			// HIDClass is asking for child deviceid & hardwareids.
-			// Let us just make up some id for our child device.
-			//
-			buffer = (PWCHAR)ExAllocatePoolWithTag(
-				NonPagedPool,
-				CROSKBLIGHT_HARDWARE_IDS_LENGTH,
-				CROSKBLIGHT_POOL_TAG
-				);
-
-			if (buffer)
-			{
-				//
-				// Do the copy, store the buffer in the Irp
-				//
-				RtlCopyMemory(buffer,
-					CROSKBLIGHT_HARDWARE_IDS,
-					CROSKBLIGHT_HARDWARE_IDS_LENGTH
-					);
-
-				Irp->IoStatus.Information = (ULONG_PTR)buffer;
-				status = STATUS_SUCCESS;
-			}
-			else
-			{
-				//
-				//  No memory
-				//
-				status = STATUS_INSUFFICIENT_RESOURCES;
-			}
-
-			Irp->IoStatus.Status = status;
-			//
-			// We don't need to forward this to our bus. This query
-			// is for our child so we should complete it right here.
-			// fallthru.
-			//
-			IoCompleteRequest(Irp, IO_NO_INCREMENT);
-
-			break;
-
-		default:
-			status = Irp->IoStatus.Status;
-			IoCompleteRequest(Irp, IO_NO_INCREMENT);
-			break;
-		}
-	}
-
-	CrosKBLightPrint(DEBUG_LEVEL_VERBOSE, DBG_IOCTL,
-		"CrosKBLightEvtWdmPreprocessMnQueryId Exit = 0x%x\n", status);
 
 	return status;
 }
